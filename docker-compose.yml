@@ -1,0 +1,85 @@
+name: leilao
+
+x-app: &app
+  build: ./server
+  restart: "no"
+  depends_on:
+    pg-primary: { condition: service_healthy }
+    sentinel-1: { condition: service_started }
+    sentinel-2: { condition: service_started }
+    sentinel-3: { condition: service_started }
+
+x-app-env: &app-env
+  PORT: "3000"
+  REDIS_SENTINELS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+  REDIS_MASTER_NAME: mymaster
+  PG_PRIMARY_URL: postgres://leilao:leilao@pg-primary:5432/leilao
+  PG_REPLICA_URL: postgres://leilao:leilao@pg-replica:5432/leilao
+
+x-sentinel: &sentinel
+  image: redis:7.4-alpine
+  volumes:
+    - ./infra/redis/sentinel.conf:/etc/redis/sentinel.template.conf:ro
+  command: sh -c "cp /etc/redis/sentinel.template.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
+  depends_on: [redis-master, redis-replica]
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: infra/nginx/Dockerfile
+    ports: ["8080:80"]
+    depends_on: [app-1, app-2, app-3]
+
+  app-1:
+    <<: *app
+    environment: { <<: *app-env, NODE_ID: app-1 }
+  app-2:
+    <<: *app
+    environment: { <<: *app-env, NODE_ID: app-2 }
+  app-3:
+    <<: *app
+    environment: { <<: *app-env, NODE_ID: app-3 }
+
+  redis-master:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes --replica-announce-ip redis-master
+  redis-replica:
+    image: redis:7.4-alpine
+    command: redis-server --appendonly yes --replicaof redis-master 6379 --replica-announce-ip redis-replica
+    depends_on: [redis-master]
+  sentinel-1: *sentinel
+  sentinel-2: *sentinel
+  sentinel-3: *sentinel
+
+  pg-primary:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: leilao
+      POSTGRES_PASSWORD: leilao
+      POSTGRES_DB: leilao
+    command: postgres -c wal_level=replica -c max_wal_senders=10 -c wal_keep_size=256MB
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./infra/postgres/primary-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leilao -d leilao"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  pg-replica:
+    image: postgres:17-alpine
+    user: postgres
+    environment:
+      PGPASSWORD: replicator
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: ["/replica-entrypoint.sh"]
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+      - ./infra/postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    depends_on:
+      pg-primary: { condition: service_healthy }
+
+volumes:
+  pg-primary-data:
+  pg-replica-data:
